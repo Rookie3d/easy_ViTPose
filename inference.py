@@ -1,211 +1,364 @@
-import argparse
-import json
+import abc
 import os
-import time
-import glob
+from typing import Optional
+import typing
 
-from PIL import Image
 import cv2
 import numpy as np
 import torch
-import tqdm
 
-from easy_ViTPose.vit_utils.inference import NumpyEncoder, VideoReader
-from easy_ViTPose.inference import VitInference
-from easy_ViTPose.vit_utils.visualization import joints_dict
+from ultralytics import YOLO
 
+from .configs.ViTPose_common import data_cfg
+from .sort import Sort
+from .vit_models.model import ViTPose
+from .vit_utils.inference import draw_bboxes, pad_image
+from .vit_utils.top_down_eval import keypoints_from_heatmaps
+from .vit_utils.util import dyn_model_import, infer_dataset_by_path
+from .vit_utils.visualization import draw_points_and_skeleton, joints_dict
 
+try:
+    import torch_tensorrt
+except ModuleNotFoundError:
+    pass
 
-def inference(args):
-    try:
-        import onnxruntime  # noqa: F401
-        has_onnx = True
-    except ModuleNotFoundError:
-        has_onnx = False
+try:
+    import onnxruntime
+except ModuleNotFoundError:
+    pass
 
-    use_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-    use_cuda = torch.cuda.is_available()
-
-    # Load Yolo
-    yolo = args.yolo
-    if yolo is None:
-        yolo = 'easy_ViTPose/' + ('yolov8s' + ('.onnx' if has_onnx and not (use_mps or use_cuda) else '.pt'))
-    input_path = args.input
-
-    # Load the image / video reader
-    try:  # Check if is webcam
-        int(input_path)
-        is_video = True
-    except ValueError:
-        assert os.path.isfile(input_path), 'The input file does not exist'
-        is_video = input_path[input_path.rfind('.') + 1:].lower() in ['avi', 'mp4', 'mov']
-
-    ext = '.mp4' if is_video else '.png'
-    assert not (args.save_img or args.save_json) or args.output_path, \
-        'Specify an output path if using save-img or save-json flags'
-    output_path = args.output_path
-
-    # Output path
-    file_output_path = os.path.join(output_path, os.path.basename(input_path))
-    os.makedirs(file_output_path, exist_ok=True)
-    og_ext = input_path[input_path.rfind('.'):]
-    save_name_img = os.path.basename(input_path).replace(og_ext, f"_result{ext}")
-    save_name_json = os.path.basename(input_path).replace(og_ext, "_result.json")
-    output_path_img = os.path.join(file_output_path, save_name_img)
-    output_path_json = os.path.join(file_output_path, save_name_json)
+__all__ = ['VitInference']
+np.bool = np.bool_
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
 
 
-    wait = 0
-    total_frames = 1
-    if is_video:
-        reader = VideoReader(input_path, args.rotate)
-        cap = cv2.VideoCapture(input_path)  # type: ignore
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        wait = 15
-        if args.save_img:
-            cap = cv2.VideoCapture(input_path)  # type: ignore
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            ret, frame = cap.read()
-            cap.release()
-            assert ret
-            assert fps > 0
-            output_size = frame.shape[:2][::-1]
+DETC_TO_YOLO_YOLOC = {
+    'human': [0],
+    'cat': [15],
+    'dog': [16],
+    'horse': [17],
+    'sheep': [18],
+    'cow': [19],
+    'elephant': [20],
+    'bear': [21],
+    'zebra': [22],
+    'giraffe': [23],
+    'animals': [15, 16, 17, 18, 19, 20, 21, 22, 23]
+}
 
-            # Check if we have X264 otherwise use default MJPG
-            try:
-                temp_video = cv2.VideoWriter('/tmp/checkcodec.mp4',
-                                             cv2.VideoWriter_fourcc(*'h264'), 30, (32, 32))
-                opened = temp_video.isOpened()
-            except Exception:
-                opened = False
-            codec = 'h264' if opened else 'MJPG'
-            out_writer = cv2.VideoWriter(output_path_img,
-                                         cv2.VideoWriter_fourcc(*codec),  # More efficient codec
-                                         fps, output_size)  # type: ignore
-    else:
-        reader = [np.array(Image.open(input_path).rotate(args.rotate))]  # type: ignore
 
-    # Initialize model
-    model = VitInference(args.model, yolo, args.model_name,
-                         args.det_class, args.dataset,
-                         args.yolo_size, is_video=is_video,
-                         single_pose=args.single_pose,
-                         yolo_step=args.yolo_step)  # type: ignore
-    print(f">>> Model loaded: {args.model}")
+class VitInference:
+    """
+    Class for performing inference using ViTPose models.
+    """
 
-    print(f'>>> Running inference on {input_path}')
-    keypoints = []
-    fps = []
-    tot_time = 0.
-    for (ith, img) in tqdm.tqdm(enumerate(reader), total=total_frames):
-        t0 = time.time()
+    def __init__(self, model: str,
+                 yolo: Optional[str] = None,
+                 model_name: Optional[str] = None,
+                 det_class: Optional[str] = None,
+                 dataset: Optional[str] = None,
+                 yolo_size: Optional[int] = 320,
+                 device: Optional[str] = None,
+                 is_video: Optional[bool] = False,
+                 single_pose: Optional[bool] = False,
+                 yolo_step: Optional[int] = 1):
+        assert os.path.isfile(model), f'The model file {model} does not exist'
 
-        # Run inference
-        frame_keypoints = model.inference(img)
-        keypoints.append(frame_keypoints)
+        # Device priority is cuda / mps / cpu
+        if device is None:
+            if torch.cuda.is_available():
+                device = 'cuda'
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
 
-        delta = time.time() - t0
-        tot_time += delta
-        fps.append(delta)
+        self.device = device
+        if yolo:
+            assert os.path.isfile(yolo), f'The YOLOv8 model {yolo} does not exist'
+            self.yolo = YOLO(yolo, task='detect')
+        else:
+            self.yolo = None
+            
+        self.yolo_size = yolo_size
+        self.yolo_step = yolo_step
+        self.is_video = is_video
+        self.single_pose = single_pose
+        self.reset()
 
-        # Draw the poses and save the output img
-        if args.show or args.save_img:
-            # Draw result and transform to BGR
-            img = model.draw(args.show_yolo, args.show_raw_yolo, args.conf_threshold)[..., ::-1]
+        # State saving during inference
+        self.save_state = True  # Can be disabled manually
+        self._img = None
+        self._yolo_res = None
+        self._tracker_res = None
+        self._keypoints = None
 
-            if args.save_img:
-                # TODO: If exists add (1), (2), ...
-                if is_video:
-                    out_writer.write(img)
+        # Use extension to decide which kind of model has been loaded
+        use_onnx = model.endswith('.onnx')
+        use_trt = model.endswith('.engine')
+
+
+        # Extract dataset name
+        if dataset is None:
+            dataset = infer_dataset_by_path(model)
+
+        assert dataset in ['mpii', 'coco', 'coco_25', 'wholebody', 'aic', 'ap10k', 'apt36k', 'custom'], \
+            'The specified dataset is not valid'
+
+        # Dataset can now be set for visualization
+        self.dataset = dataset
+
+        # if we picked the dataset switch to correct yolo classes if not set
+        if det_class is None:
+            det_class = 'animals' if dataset in ['ap10k', 'apt36k'] else 'human'
+        self.yolo_classes = DETC_TO_YOLO_YOLOC[det_class]
+
+        assert model_name in [None, 's', 'b', 'l', 'h'], \
+            f'The model name {model_name} is not valid'
+
+        # onnx / trt models do not require model_cfg specification
+        if model_name is None:
+            assert use_onnx or use_trt, \
+                'Specify the model_name if not using onnx / trt'
+        else:
+            # Dynamically import the model class
+            model_cfg = dyn_model_import(self.dataset, model_name)
+
+        self.target_size = data_cfg['image_size']
+        if use_onnx:
+            self._ort_session = onnxruntime.InferenceSession(model,
+                                                             providers=['CUDAExecutionProvider',
+                                                                        'CPUExecutionProvider'])
+            inf_fn = self._inference_onnx
+        else:
+            self._vit_pose = ViTPose(model_cfg)
+            self._vit_pose.eval()
+
+            if use_trt:
+                self._vit_pose = torch.jit.load(model)
+            else:
+                ckpt = torch.load(model, map_location='cpu', weights_only=True)
+                if 'state_dict' in ckpt:
+                    self._vit_pose.load_state_dict(ckpt['state_dict'])
                 else:
-                    print('>>> Saving output image')
-                    cv2.imwrite(output_path_img, img)
+                    self._vit_pose.load_state_dict(ckpt)
+                self._vit_pose.to(torch.device(device))
 
-            if args.show:
-                cv2.imshow('preview', img)
-                cv2.waitKey(wait)
+            inf_fn = self._inference_torch
 
-    if is_video:
-        tot_poses = sum(len(k) for k in keypoints)
-        print(f'>>> Mean inference FPS: {1 / np.mean(fps):.2f}')
-        print(f'>>> Total poses predicted: {tot_poses} mean per frame: '
-              f'{(tot_poses / (ith + 1)):.2f}')
-        print(f'>>> Mean FPS per pose: {(tot_poses / tot_time):.2f}')
+        # Override _inference abstract with selected engine
+        self._inference = inf_fn  # type: ignore
 
-    if args.save_json:
-        print('>>> Saving output json')
-        with open(output_path_json, 'w') as f:
-            out = {'keypoints': keypoints,
-                   'skeleton': joints_dict()[model.dataset]['keypoints']}
-            json.dump(out, f, cls=NumpyEncoder)
+    def reset(self):
+        """
+        Reset the inference class to be ready for a new video.
+        This will reset the internal counter of frames, on videos
+        this is necessary to reset the tracker.
+        """
+        min_hits = 3 if self.yolo_step == 1 else 1
+        use_tracker = self.is_video and not self.single_pose
+        self.tracker = Sort(max_age=self.yolo_step,
+                            min_hits=min_hits,
+                            iou_threshold=0.3) if use_tracker else None  # TODO: Params
+        self.frame_counter = 0
 
-    if is_video and args.save_img:
-        out_writer.release()
-    cv2.destroyAllWindows()
+    @classmethod
+    def postprocess(cls, heatmaps, org_w, org_h):
+        """
+        Postprocess the heatmaps to obtain keypoints and their probabilities.
 
+        Args:
+            heatmaps (ndarray): Heatmap predictions from the model.
+            org_w (int): Original width of the image.
+            org_h (int): Original height of the image.
 
+        Returns:
+            ndarray: Processed keypoints with probabilities.
+        """
+        points, prob = keypoints_from_heatmaps(heatmaps=heatmaps,
+                                               center=np.array([[org_w // 2,
+                                                                 org_h // 2]]),
+                                               scale=np.array([[org_w, org_h]]),
+                                               unbiased=True, use_udp=True)
+        return np.concatenate([points[:, :, ::-1], prob], axis=2)
 
+    @abc.abstractmethod
+    def _inference(self, img: np.ndarray) -> np.ndarray:
+        """
+        Abstract method for performing inference on an image.
+        It is overloaded by each inference engine.
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input', type=str, required=True,
-                        help='path to image / video or webcam ID (=cv2)')
-    parser.add_argument('--output-path', type=str, default='',
-                        help='output path, if the path provided is a directory '
-                        'output files are "input_name +_result{extension}".')
-    parser.add_argument('--model', type=str, required=True,
-                        help='checkpoint path of the model')
-    parser.add_argument('--yolo', type=str, required=False, default=None,
-                        help='checkpoint path of the yolo model')
-    parser.add_argument('--dataset', type=str, required=False, default=None,
-                        help='Name of the dataset. If None it"s extracted from the file name. \
-                              ["coco", "coco_25", "wholebody", "mpii", "ap10k", "apt36k", "aic", "custom"]')
-    parser.add_argument('--det-class', type=str, required=False, default=None,
-                        help='["human", "cat", "dog", "horse", "sheep", \
-                               "cow", "elephant", "bear", "zebra", "giraffe", "animals"]')
-    parser.add_argument('--model-name', type=str, required=False, choices=['s', 'b', 'l', 'h'],
-                        help='[s: ViT-S, b: ViT-B, l: ViT-L, h: ViT-H]')
-    parser.add_argument('--yolo-size', type=int, required=False, default=320,
-                        help='YOLO image size during inference')
-    parser.add_argument('--conf-threshold', type=float, required=False, default=0.5,
-                        help='Minimum confidence for keypoints to be drawn. [0, 1] range')
-    parser.add_argument('--rotate', type=int, choices=[0, 90, 180, 270],
-                        required=False, default=0,
-                        help='Rotate the image of [90, 180, 270] degress counterclockwise')
-    parser.add_argument('--yolo-step', type=int,
-                        required=False, default=1,
-                        help='The tracker can be used to predict the bboxes instead of yolo for performance, '
-                             'this flag specifies how often yolo is applied (e.g. 1 applies yolo every frame). '
-                             'This does not have any effect when is_video is False')
-    parser.add_argument('--single-pose', default=False, action='store_true',
-                        help='Do not use SORT tracker because single pose is expected in the video')
-    parser.add_argument('--show', default=False, action='store_true',
-                        help='preview result during inference')
-    parser.add_argument('--show-yolo', default=False, action='store_true',
-                        help='draw yolo results')
-    parser.add_argument('--show-raw-yolo', default=False, action='store_true',
-                        help='draw yolo result before that SORT is applied for tracking'
-                        ' (only valid during video inference)')
-    parser.add_argument('--save-img', default=False, action='store_true',
-                        help='save image results')
-    parser.add_argument('--save-json', default=False, action='store_true',
-                        help='save json results')
-    args = parser.parse_args()
+        Args:
+            img (ndarray): Input image for inference.
 
+        Returns:
+            ndarray: Inference results.
+        """
+        raise NotImplementedError
 
+    def inference(self, img: np.ndarray) -> dict[typing.Any, typing.Any]:
+        """
+        Perform inference on the input image.
 
-    # If the input is a folder
-    if os.path.isdir(args.input): 
-            video_files = glob.glob(os.path.join(args.input, '*'))
-            video_files = [f for f in video_files if f.lower().endswith(('.avi', '.mp4', '.mov'))]
-            assert video_files, 'No video files found in the directory'
+        Args:
+            img (ndarray): Input image for inference in RGB format.
 
-            # Run inference on each video file
-            for video_file in video_files:
-                # Perform inference on each video file
-                print(f">>> Running inference on video: {video_file}")
-                args.input = video_file  # Update the input argument to the current video file
-                inference(args)
-    else:
-        inference(args)
+        Returns:
+            dict[typing.Any, typing.Any]: Inference results.
+        """
+        if self.yolo is None:
+            raise ValueError("YOLO model not provided. Please use inference_with_bboxes.")
+
+        # First use YOLOv8 for detection
+        res_pd = np.empty((0, 5))
+        results = None
+        if (self.tracker is None or
+           (self.frame_counter % self.yolo_step == 0 or self.frame_counter < 3)):
+            results = self.yolo(img[..., ::-1], verbose=False, imgsz=self.yolo_size,
+                                device=self.device if self.device != 'cuda' else 0,
+                                classes=self.yolo_classes)[0]
+            res_pd = np.array([r[:5].tolist() for r in  # TODO: Confidence threshold
+                               results.boxes.data.cpu().numpy() if r[4] > 0.35]).reshape((-1, 5))
+        self.frame_counter += 1
+
+        frame_keypoints = {}
+        scores_bbox = {}
+        ids = None
+        if self.tracker is not None:
+            res_pd = self.tracker.update(res_pd)
+            ids = res_pd[:, 5].astype(int).tolist()
+
+        # Prepare boxes for inference
+        bboxes = res_pd[:, :4].round().astype(int)
+        scores = res_pd[:, 4].tolist()
+        pad_bbox = 10
+
+        if ids is None:
+            ids = range(len(bboxes))
+
+        for bbox, id, score in zip(bboxes, ids, scores):
+            # TODO: Slightly bigger bbox
+            bbox[[0, 2]] = np.clip(bbox[[0, 2]] + [-pad_bbox, pad_bbox], 0, img.shape[1])
+            bbox[[1, 3]] = np.clip(bbox[[1, 3]] + [-pad_bbox, pad_bbox], 0, img.shape[0])
+
+            # Crop image and pad to 3/4 aspect ratio
+            img_inf = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+            img_inf, (left_pad, top_pad) = pad_image(img_inf, 3 / 4)
+
+            keypoints = self._inference(img_inf)[0]
+            # Transform keypoints to original image
+            keypoints[:, :2] += bbox[:2][::-1] - [top_pad, left_pad]
+            frame_keypoints[id] = keypoints
+            scores_bbox[id] = score  # Replace this with avg_keypoint_conf*person_obj_conf. For now, only person_obj_conf from yolo is being used.
+
+        if self.save_state:
+            self._img = img
+            self._yolo_res = results
+            self._tracker_res = (bboxes, ids, scores)
+            self._keypoints = frame_keypoints
+            self._scores_bbox = scores_bbox
+
+        return frame_keypoints
+
+    def inference_with_bboxes(self, img: np.ndarray, bboxes: np.ndarray) -> dict[typing.Any, typing.Any]:
+        """
+        Perform inference on the input image using provided bounding boxes.
+
+        Args:
+            img (ndarray): Input image for inference in RGB format.
+            bboxes (np.ndarray): An array of bounding boxes, where each row is [x1, y1, x2, y2, score].
+
+        Returns:
+            dict[typing.Any, typing.Any]: Inference results.
+        """
+        self.frame_counter += 1
+
+        frame_keypoints = {}
+        scores_bbox = {}
+        ids = None
+        res_pd = bboxes
+        if self.tracker is not None:
+            res_pd = self.tracker.update(res_pd)
+            ids = res_pd[:, 5].astype(int).tolist()
+            
+        # Prepare boxes for inference
+        bboxes = res_pd[:, :4].round().astype(int)
+        scores = res_pd[:, 4].tolist()
+        pad_bbox = 10
+
+        if ids is None:
+            ids = range(len(bboxes))
+
+        for bbox, id, score in zip(bboxes, ids, scores):
+            # TODO: Slightly bigger bbox
+            bbox[[0, 2]] = np.clip(bbox[[0, 2]] + [-pad_bbox, pad_bbox], 0, img.shape[1])
+            bbox[[1, 3]] = np.clip(bbox[[1, 3]] + [-pad_bbox, pad_bbox], 0, img.shape[0])
+
+            # Crop image and pad to 3/4 aspect ratio
+            img_inf = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+            img_inf, (left_pad, top_pad) = pad_image(img_inf, 3 / 4)
+
+            keypoints = self._inference(img_inf)[0]
+            # Transform keypoints to original image
+            keypoints[:, :2] += bbox[:2][::-1] - [top_pad, left_pad]
+            frame_keypoints[id] = keypoints
+            scores_bbox[id] = score
+
+        if self.save_state:
+            self._img = img
+            self._yolo_res = None  # No YOLO results when using this method
+            self._tracker_res = (bboxes, ids, scores)
+            self._keypoints = frame_keypoints
+            self._scores_bbox = scores_bbox
+
+        return frame_keypoints
+        
+    def draw(self, show_yolo=True, show_raw_yolo=False, confidence_threshold=0.5):
+        """
+        Draw keypoints and bounding boxes on the image.
+        """
+        img = self._img.copy()
+        bboxes, ids, scores = self._tracker_res
+
+        if self._yolo_res is not None and (show_raw_yolo or (self.tracker is None and show_yolo)):
+            img = np.array(self._yolo_res.plot())[..., ::-1]
+
+        if show_yolo and self.tracker is not None:
+            img = draw_bboxes(img, bboxes, ids, scores)
+
+        img = np.array(img)[..., ::-1]  # RGB to BGR for cv2 modules
+        for idx, k in self._keypoints.items():
+            img = draw_points_and_skeleton(img.copy(), k,
+                                           joints_dict()[self.dataset]['skeleton'],
+                                           person_index=idx,
+                                           points_color_palette='gist_rainbow',
+                                           skeleton_color_palette='jet',
+                                           points_palette_samples=10,
+                                           confidence_threshold=confidence_threshold)
+        return img[..., ::-1]  # Return RGB as original
+
+    def pre_img(self, img):
+        org_h, org_w = img.shape[:2]
+        img_input = cv2.resize(img, self.target_size, interpolation=cv2.INTER_LINEAR) / 255
+        img_input = ((img_input - MEAN) / STD).transpose(2, 0, 1)[None].astype(np.float32)
+        return img_input, org_h, org_w
+
+    @torch.no_grad()
+    def _inference_torch(self, img: np.ndarray) -> np.ndarray:
+        # Prepare input data
+        img_input, org_h, org_w = self.pre_img(img)
+        img_input = torch.from_numpy(img_input).to(torch.device(self.device))
+
+        # Feed to model
+        heatmaps = self._vit_pose(img_input).detach().cpu().numpy()
+        return self.postprocess(heatmaps, org_w, org_h)
+
+    def _inference_onnx(self, img: np.ndarray) -> np.ndarray:
+        # Prepare input data
+        img_input, org_h, org_w = self.pre_img(img)
+
+        # Feed to model
+        ort_inputs = {self._ort_session.get_inputs()[0].name: img_input}
+        heatmaps = self._ort_session.run(None, ort_inputs)[0]
+        return self.postprocess(heatmaps, org_w, org_h)
