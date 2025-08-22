@@ -50,36 +50,11 @@ DETC_TO_YOLO_YOLOC = {
 
 class VitInference:
     """
-    Class for performing inference using ViTPose models with YOLOv8 human detection and SORT tracking.
-
-    Args:
-        model (str): Path to the ViT model file (.pth, .onnx, .engine).
-        yolo (str): Path of the YOLOv8 model to load.
-        model_name (str, optional): Name of the ViT model architecture to use.
-                                    Valid values are 's', 'b', 'l', 'h'.
-                                    Defaults to None, is necessary when using .pth checkpoints.
-        det_class (str, optional): the detection class. if None it is inferred by the dataset.
-                                   valid values are 'human', 'cat', 'dog', 'horse', 'sheep',
-                                                    'cow', 'elephant', 'bear', 'zebra', 'giraffe',
-                                                    'animals' (which is all previous but human)
-        dataset (str, optional): Name of the dataset. If None it's extracted from the file name.
-                                 Valid values are 'coco', 'coco_25', 'wholebody', 'mpii',
-                                                  'ap10k', 'apt36k', 'aic'
-        yolo_size (int, optional): Size of the input image for YOLOv8 model. Defaults to 320.
-        device (str, optional): Device to use for inference. Defaults to 'cuda' if available, else 'cpu'.
-        is_video (bool, optional): Flag indicating if the input is video. Defaults to False.
-        single_pose (bool, optional): Flag indicating if the video (on images this flag has no effect)
-                                      will contain a single pose.
-                                      In this case the SORT tracker is not used (increasing performance)
-                                      but people id tracking
-                                      won't be consistent among frames.
-        yolo_step (int, optional): The tracker can be used to predict the bboxes instead of yolo for performance,
-                                   this flag specifies how often yolo is applied (e.g. 1 applies yolo every frame).
-                                   This does not have any effect when is_video is False.
+    Class for performing inference using ViTPose models.
     """
 
     def __init__(self, model: str,
-                 yolo: str,
+                 yolo: Optional[str] = None, # <--- THIS LINE IS THE FIX
                  model_name: Optional[str] = None,
                  det_class: Optional[str] = None,
                  dataset: Optional[str] = None,
@@ -89,7 +64,6 @@ class VitInference:
                  single_pose: Optional[bool] = False,
                  yolo_step: Optional[int] = 1):
         assert os.path.isfile(model), f'The model file {model} does not exist'
-        assert os.path.isfile(yolo), f'The YOLOv8 model {yolo} does not exist'
 
         # Device priority is cuda / mps / cpu
         if device is None:
@@ -101,7 +75,12 @@ class VitInference:
                 device = 'cpu'
 
         self.device = device
-        self.yolo = YOLO(yolo, task='detect')
+        if yolo:
+            assert os.path.isfile(yolo), f'The YOLOv8 model {yolo} does not exist'
+            self.yolo = YOLO(yolo, task='detect')
+        else:
+            self.yolo = None
+
         self.yolo_size = yolo_size
         self.yolo_step = yolo_step
         self.is_video = is_video
@@ -188,14 +167,6 @@ class VitInference:
     def postprocess(cls, heatmaps, org_w, org_h):
         """
         Postprocess the heatmaps to obtain keypoints and their probabilities.
-
-        Args:
-            heatmaps (ndarray): Heatmap predictions from the model.
-            org_w (int): Original width of the image.
-            org_h (int): Original height of the image.
-
-        Returns:
-            ndarray: Processed keypoints with probabilities.
         """
         points, prob = keypoints_from_heatmaps(heatmaps=heatmaps,
                                                center=np.array([[org_w // 2,
@@ -208,26 +179,15 @@ class VitInference:
     def _inference(self, img: np.ndarray) -> np.ndarray:
         """
         Abstract method for performing inference on an image.
-        It is overloaded by each inference engine.
-
-        Args:
-            img (ndarray): Input image for inference.
-
-        Returns:
-            ndarray: Inference results.
         """
         raise NotImplementedError
 
     def inference(self, img: np.ndarray) -> dict[typing.Any, typing.Any]:
         """
         Perform inference on the input image.
-
-        Args:
-            img (ndarray): Input image for inference in RGB format.
-
-        Returns:
-            dict[typing.Any, typing.Any]: Inference results.
         """
+        if self.yolo is None:
+            raise ValueError("YOLO model not provided. Please use inference_with_bboxes.")
 
         # First use YOLOv8 for detection
         res_pd = np.empty((0, 5))
@@ -237,7 +197,7 @@ class VitInference:
             results = self.yolo(img[..., ::-1], verbose=False, imgsz=self.yolo_size,
                                 device=self.device if self.device != 'cuda' else 0,
                                 classes=self.yolo_classes)[0]
-            res_pd = np.array([r[:5].tolist() for r in  # TODO: Confidence threshold
+            res_pd = np.array([r[:5].tolist() for r in
                                results.boxes.data.cpu().numpy() if r[4] > 0.35]).reshape((-1, 5))
         self.frame_counter += 1
 
@@ -257,19 +217,16 @@ class VitInference:
             ids = range(len(bboxes))
 
         for bbox, id, score in zip(bboxes, ids, scores):
-            # TODO: Slightly bigger bbox
             bbox[[0, 2]] = np.clip(bbox[[0, 2]] + [-pad_bbox, pad_bbox], 0, img.shape[1])
             bbox[[1, 3]] = np.clip(bbox[[1, 3]] + [-pad_bbox, pad_bbox], 0, img.shape[0])
 
-            # Crop image and pad to 3/4 aspect ratio
             img_inf = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
             img_inf, (left_pad, top_pad) = pad_image(img_inf, 3 / 4)
 
             keypoints = self._inference(img_inf)[0]
-            # Transform keypoints to original image
             keypoints[:, :2] += bbox[:2][::-1] - [top_pad, left_pad]
             frame_keypoints[id] = keypoints
-            scores_bbox[id] = score  # Replace this with avg_keypoint_conf*person_obj_conf. For now, only person_obj_conf from yolo is being used.
+            scores_bbox[id] = score
 
         if self.save_state:
             self._img = img
@@ -280,16 +237,51 @@ class VitInference:
 
         return frame_keypoints
 
+    def inference_with_bboxes(self, img: np.ndarray, bboxes: np.ndarray) -> dict[typing.Any, typing.Any]:
+        """
+        Perform inference on the input image using provided bounding boxes.
+        """
+        self.frame_counter += 1
+
+        frame_keypoints = {}
+        scores_bbox = {}
+        ids = None
+        res_pd = bboxes
+        if self.tracker is not None:
+            res_pd = self.tracker.update(res_pd)
+            ids = res_pd[:, 5].astype(int).tolist()
+
+        bboxes = res_pd[:, :4].round().astype(int)
+        scores = res_pd[:, 4].tolist()
+        pad_bbox = 10
+
+        if ids is None:
+            ids = range(len(bboxes))
+
+        for bbox, id, score in zip(bboxes, ids, scores):
+            bbox[[0, 2]] = np.clip(bbox[[0, 2]] + [-pad_bbox, pad_bbox], 0, img.shape[1])
+            bbox[[1, 3]] = np.clip(bbox[[1, 3]] + [-pad_bbox, pad_bbox], 0, img.shape[0])
+
+            img_inf = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+            img_inf, (left_pad, top_pad) = pad_image(img_inf, 3 / 4)
+
+            keypoints = self._inference(img_inf)[0]
+            keypoints[:, :2] += bbox[:2][::-1] - [top_pad, left_pad]
+            frame_keypoints[id] = keypoints
+            scores_bbox[id] = score
+
+        if self.save_state:
+            self._img = img
+            self._yolo_res = None
+            self._tracker_res = (bboxes, ids, scores)
+            self._keypoints = frame_keypoints
+            self._scores_bbox = scores_bbox
+
+        return frame_keypoints
+
     def draw(self, show_yolo=True, show_raw_yolo=False, confidence_threshold=0.5):
         """
         Draw keypoints and bounding boxes on the image.
-
-        Args:
-            show_yolo (bool, optional): Whether to show YOLOv8 bounding boxes. Default is True.
-            show_raw_yolo (bool, optional): Whether to show raw YOLOv8 bounding boxes. Default is False.
-
-        Returns:
-            ndarray: Image with keypoints and bounding boxes drawn.
         """
         img = self._img.copy()
         bboxes, ids, scores = self._tracker_res
@@ -300,7 +292,7 @@ class VitInference:
         if show_yolo and self.tracker is not None:
             img = draw_bboxes(img, bboxes, ids, scores)
 
-        img = np.array(img)[..., ::-1]  # RGB to BGR for cv2 modules
+        img = np.array(img)[..., ::-1]
         for idx, k in self._keypoints.items():
             img = draw_points_and_skeleton(img.copy(), k,
                                            joints_dict()[self.dataset]['skeleton'],
@@ -309,7 +301,7 @@ class VitInference:
                                            skeleton_color_palette='jet',
                                            points_palette_samples=10,
                                            confidence_threshold=confidence_threshold)
-        return img[..., ::-1]  # Return RGB as original
+        return img[..., ::-1]
 
     def pre_img(self, img):
         org_h, org_w = img.shape[:2]
@@ -319,19 +311,13 @@ class VitInference:
 
     @torch.no_grad()
     def _inference_torch(self, img: np.ndarray) -> np.ndarray:
-        # Prepare input data
         img_input, org_h, org_w = self.pre_img(img)
         img_input = torch.from_numpy(img_input).to(torch.device(self.device))
-
-        # Feed to model
         heatmaps = self._vit_pose(img_input).detach().cpu().numpy()
         return self.postprocess(heatmaps, org_w, org_h)
 
     def _inference_onnx(self, img: np.ndarray) -> np.ndarray:
-        # Prepare input data
         img_input, org_h, org_w = self.pre_img(img)
-
-        # Feed to model
         ort_inputs = {self._ort_session.get_inputs()[0].name: img_input}
         heatmaps = self._ort_session.run(None, ort_inputs)[0]
         return self.postprocess(heatmaps, org_w, org_h)
